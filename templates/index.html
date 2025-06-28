@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Speech API Interface</title>
+    <style>
+        :root {
+            --primary-color: #007bff;
+            --secondary-color: #6c757d;
+            --background-color: #f8f9fa;
+            --surface-color: #ffffff;
+            --text-color: #212529;
+            --border-color: #dee2e6;
+            --error-color: #dc3545;
+            --success-color: #28a745;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background-color: var(--background-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 2rem;
+            display: flex;
+            justify-content: center;
+        }
+        .container {
+            width: 100%;
+            max-width: 900px;
+        }
+        h1, h2 {
+            color: var(--primary-color);
+            text-align: center;
+        }
+        .card {
+            background-color: var(--surface-color);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 2rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        .form-group {
+            margin-bottom: 1.5rem;
+        }
+        label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-weight: bold;
+        }
+        input[type="file"], textarea, select {
+            width: 100%;
+            padding: 0.75rem;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        textarea {
+            min-height: 120px;
+            resize: vertical;
+        }
+        .btn {
+            display: inline-block;
+            padding: 0.75rem 1.5rem;
+            font-size: 1rem;
+            font-weight: bold;
+            text-align: center;
+            color: #fff;
+            background-color: var(--primary-color);
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        .btn:hover {
+            background-color: #0056b3;
+        }
+        .btn:disabled {
+            background-color: var(--secondary-color);
+            cursor: not-allowed;
+        }
+        .result-box {
+            background-color: #e9ecef;
+            padding: 1rem;
+            border-radius: 4px;
+            border: 1px solid var(--border-color);
+            min-height: 50px;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        .status {
+            margin-top: 1rem;
+            font-style: italic;
+            color: var(--secondary-color);
+        }
+        .error {
+            color: var(--error-color);
+        }
+        audio {
+            width: 100%;
+            margin-top: 1rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Speech API Interface</h1>
+
+        <div class="card">
+            <h2>Speech to Text (LQ)</h2>
+            <div class="form-group">
+                <label for="stt-file">Upload Audio File (.wav, .mp3, .ogg)</label>
+                <input type="file" id="stt-file" accept=".wav,.mp3,.ogg">
+            </div>
+            <button id="stt-btn" class="btn">Transcribe</button>
+            <div class="status" id="stt-status"></div>
+            <div class="form-group" style="margin-top: 1.5rem;">
+                <label>Transcription Result:</label>
+                <div id="stt-result" class="result-box"></div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Text to Speech (TTS)</h2>
+            <div class="form-group">
+                <label for="tts-text">Enter Text</label>
+                <textarea id="tts-text" placeholder="Type something to synthesize..."></textarea>
+            </div>
+            <div class="form-group">
+                <label for="tts-voice">Select Voice</label>
+                <select id="tts-voice"></select>
+            </div>
+            <div class="form-group">
+                <label for="tts-format">Select Format (LQ Only)</label>
+                <select id="tts-format">
+                    <option value="mp3" selected>MP3</option>
+                    <option value="wav">WAV</option>
+                    <option value="ogg">OGG</option>
+                    <option value="flac">FLAC</option>
+                </select>
+                <small>HQ generation is always WAV format.</small>
+            </div>
+            <button id="tts-btn" class="btn">Synthesize</button>
+            <div class="status" id="tts-status"></div>
+            <audio id="tts-audio" controls style="display: none;"></audio>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const apiUrl = `${window.location.protocol}//${window.location.host}`;
+
+            // --- Common Elements ---
+            const sttBtn = document.getElementById('stt-btn');
+            const sttStatus = document.getElementById('stt-status');
+            const sttResult = document.getElementById('stt-result');
+            const sttFile = document.getElementById('stt-file');
+            
+            const ttsBtn = document.getElementById('tts-btn');
+            const ttsStatus = document.getElementById('tts-status');
+            const ttsText = document.getElementById('tts-text');
+            const ttsVoice = document.getElementById('tts-voice');
+            const ttsFormat = document.getElementById('tts-format');
+            const ttsAudio = document.getElementById('tts-audio');
+
+            // --- STT Logic ---
+            sttBtn.addEventListener('click', async () => {
+                if (!sttFile.files || sttFile.files.length === 0) {
+                    sttStatus.textContent = 'Please select a file first.';
+                    sttStatus.className = 'status error';
+                    return;
+                }
+
+                const file = sttFile.files[0];
+                const formData = new FormData();
+                formData.append('file', file);
+
+                sttBtn.disabled = true;
+                sttStatus.textContent = 'Uploading and processing...';
+                sttStatus.className = 'status';
+                sttResult.textContent = '';
+
+                try {
+                    const response = await fetch(`${apiUrl}/transcribe_lq`, {
+                        method: 'POST',
+                        body: formData,
+                    });
+
+                    const data = await response.json();
+
+                    if (response.ok) {
+                        sttResult.textContent = data.transcription;
+                        sttStatus.textContent = 'Transcription successful!';
+                        sttStatus.className = 'status success';
+                    } else {
+                        throw new Error(data.error || 'An unknown error occurred.');
+                    }
+                } catch (error) {
+                    sttResult.textContent = '';
+                    sttStatus.textContent = `Error: ${error.message}`;
+                    sttStatus.className = 'status error';
+                } finally {
+                    sttBtn.disabled = false;
+                }
+            });
+
+            // --- TTS Logic ---
+
+            async function loadVoices() {
+                ttsVoice.innerHTML = ''; // Clear existing options
+                
+                // Create option groups
+                const lqGroup = document.createElement('optgroup');
+                lqGroup.label = 'LQ Generation (Fast)';
+                const hqGroup = document.createElement('optgroup');
+                hqGroup.label = 'HQ Generation (High Quality)';
+
+                let hqAvailable = false;
+
+                try {
+                    // Fetch LQ voices
+                    const lqResponse = await fetch(`${apiUrl}/tts/voices_lq`);
+                    if (lqResponse.ok) {
+                        const lqData = await lqResponse.json();
+                        lqData.voices.forEach(voice => {
+                            const option = document.createElement('option');
+                            option.value = voice.id;
+                            option.textContent = `${voice.description}`;
+                            lqGroup.appendChild(option);
+                        });
+                    }
+
+                    // Fetch HQ voices
+                    const hqResponse = await fetch(`${apiUrl}/tts/voices_hq`);
+                    if (hqResponse.ok) {
+                        const hqData = await hqResponse.json();
+                        // hqData.voices is an object { "DisplayName": "voice_id" }
+                        for (const displayName in hqData.voices) {
+                            const option = document.createElement('option');
+                            option.value = hqData.voices[displayName];
+                            option.textContent = displayName; // Use the pretty name for display
+                            hqGroup.appendChild(option);
+                        }
+                        if (Object.keys(hqData.voices).length > 0) {
+                            hqAvailable = true;
+                        }
+                    }
+
+                } catch (error) {
+                    ttsStatus.textContent = `Error loading voices: ${error.message}`;
+                    ttsStatus.className = 'status error';
+                } finally {
+                    ttsVoice.appendChild(lqGroup);
+                    if (hqAvailable) {
+                        ttsVoice.appendChild(hqGroup);
+                    }
+                }
+            }
+            
+            loadVoices();
+
+            // Handle synthesis button click
+            ttsBtn.addEventListener('click', async () => {
+                const text = ttsText.value.trim();
+                if (!text) {
+                    ttsStatus.textContent = 'Please enter some text.';
+                    ttsStatus.className = 'status error';
+                    return;
+                }
+                
+                const selectedVoice = ttsVoice.value;
+                
+                // Determine if the selected voice is HQ (Kokoro) or LQ
+                const isHq = selectedVoice.startsWith('af_') || selectedVoice.startsWith('am_') || selectedVoice.startsWith('bf_') || selectedVoice.startsWith('bm_');
+                
+                const endpoint = isHq ? `${apiUrl}/tts/synthesize_hq` : `${apiUrl}/tts/synthesize_lq`;
+                
+                const payload = {
+                    text: text,
+                    voice: selectedVoice,
+                    format: ttsFormat.value // This is used by LQ, ignored by HQ
+                };
+
+                ttsBtn.disabled = true;
+                ttsStatus.textContent = `Synthesizing audio (${isHq ? 'HQ' : 'LQ'})...`;
+                ttsStatus.className = 'status';
+                ttsAudio.style.display = 'none';
+
+                try {
+                    const response = await fetch(endpoint, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload),
+                    });
+
+                    if (response.ok) {
+                        const blob = await response.blob();
+                        const audioUrl = URL.createObjectURL(blob);
+                        ttsAudio.src = audioUrl;
+                        ttsAudio.style.display = 'block';
+                        ttsStatus.textContent = 'Synthesis successful!';
+                        ttsStatus.className = 'status success';
+                    } else {
+                        const errorData = await response.json();
+                        throw new Error(errorData.error || 'An unknown error occurred.');
+                    }
+
+                } catch (error) {
+                    ttsStatus.textContent = `Error: ${error.message}`;
+                    ttsStatus.className = 'status error';
+                } finally {
+                    ttsBtn.disabled = false;
+                }
+            });
+        });
+    </script>
+</body>
+</html>
