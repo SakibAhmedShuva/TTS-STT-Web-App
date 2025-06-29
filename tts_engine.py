@@ -1,193 +1,172 @@
-import torch
-import numpy as np
-from transformers import VitsModel, AutoTokenizer
-import soundfile as sf
-from datetime import datetime
-import threading
-import queue
 import os
+import gc
+import time
+import logging
+import traceback
+import torch
+import soundfile as sf
+import numpy as np
 from pydub import AudioSegment
 from TTS.api import TTS
-import time
 
-class PublicDynamicTTS:
+# --- HQ (Kokoro) TTS Imports ---
+try:
+    from kokoro import KModel, KPipeline
+    import kokoro
+    KOKORO_AVAILABLE = True
+    kokoro_version = getattr(kokoro, '__version__', 'N/A')
+    print(f'DEBUG: Kokoro version {kokoro_version} found.')
+except ImportError:
+    KOKORO_AVAILABLE = False
+    print("WARNING: Kokoro library not found. HQ TTS features will be disabled.")
+    KModel, KPipeline = None, None
+
+# --- Configuration ---
+OUTPUT_FOLDER = 'outputs'
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+CUDA_AVAILABLE = torch.cuda.is_available()
+
+class LQTTS:
+    """A simplified TTS engine for the Tacotron2 model."""
     def __init__(self):
-        """Initialize the TTS service with public models"""
-        print("Loading TTS models... This may take a few moments.")
-        # Direct initialization of TTS models without any modifications
-        self.female_1 = TTS(model_name="tts_models/en/ljspeech/tacotron2-DDC", progress_bar=True, gpu=False)
-        self.female_2 = TTS(model_name="tts_models/en/ljspeech/fast_pitch", gpu=False)
-        
-        # Keep VITS for male voices
-        self.male_model = VitsModel.from_pretrained("facebook/mms-tts-eng")
-        self.tokenizer = AutoTokenizer.from_pretrained("facebook/mms-tts-eng")
-        
-        # Basic initialization
-        self.task_queue = queue.Queue()
-        self.task_statuses = {}
-        self.output_dir = "tts_outputs"
+        print("Loading LQ TTS model (tacotron2-DDC)... This may take a moment.")
+        self.model = TTS(model_name="tts_models/en/ljspeech/tacotron2-DDC", progress_bar=True, gpu=False)
+        self.output_dir = OUTPUT_FOLDER
         self.supported_formats = ['wav', 'flac', 'ogg', 'mp3']
-        os.makedirs(self.output_dir, exist_ok=True)
-        
-        self.start_task_processor()
-
-    def convert_text_to_speech(self, text, voice="female_1", language="en-US", speed=1.0):
-        """Convert text to speech"""
-        try:
-            task_id = f"task_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            self.task_statuses[task_id] = "processing"
-            
-            output_path = os.path.join(self.output_dir, f"{task_id}.wav")
-            
-            if voice == "female_1":
-                self.female_1.tts_to_file(text=text, file_path=output_path)
-                self.task_statuses[task_id] = "completed"
-            elif voice == "female_2":
-                self.female_2.tts_to_file(text=text, file_path=output_path)
-                self.task_statuses[task_id] = "completed"
-            else:
-                # Male voice processing
-                inputs = self.tokenizer(text, return_tensors="pt")
-                with torch.no_grad():
-                    output = self.male_model(**inputs).waveform
-                    if voice == "male_2":
-                        output = output * 0.8  # Simple pitch adjustment for male_2
-                    
-                sf.write(output_path, output.numpy().T, 16000)
-                self.task_statuses[task_id] = "completed"
-            
-            return task_id
-            
-        except Exception as e:
-            print(f"Conversion error: {str(e)}")
-            self.task_statuses[task_id] = "failed"
-            return None
-
-    def save_speech_file(self, text, voice="female_1", language="en-US", format="wav", destination=None):
-        """Save speech to file"""
-        try:
-            format = format.lower()
-            if format not in self.supported_formats:
-                raise ValueError(f"Unsupported format: {format}. Use: {self.supported_formats}")
-            
-            if destination is None:
-                destination = os.path.join(
-                    self.output_dir, 
-                    f"speech_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{format}"
-                )
-            
-            # Direct generation for female voices
-            if voice == "female_1":
-                self.female_1.tts_to_file(text=text, file_path=destination)
-            elif voice == "female_2":
-                self.female_2.tts_to_file(text=text, file_path=destination)
-            else:
-                # Male voice processing
-                inputs = self.tokenizer(text, return_tensors="pt")
-                with torch.no_grad():
-                    output = self.male_model(**inputs).waveform
-                    if voice == "male_2":
-                        output = output * 0.8
-                
-                if format == 'mp3':
-                    audio = AudioSegment(
-                        output.numpy().tobytes(),
-                        frame_rate=16000,
-                        sample_width=2,
-                        channels=1
-                    )
-                    audio.export(destination, format='mp3', bitrate='128k')
-                else:
-                    sf.write(destination, output.numpy().T, 16000, format=format)
-            
-            return {"status": "success", "file_path": destination}
-            
-        except Exception as e:
-            print(f"Save error: {str(e)}")
-            return None
-
-    def stream_speech(self, text, voice="female_1", language="en-US"):
-        """Stream speech output"""
-        try:
-            temp_path = os.path.join(self.output_dir, f"stream_temp_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav")
-            
-            # Generate audio
-            if voice == "female_1":
-                self.female_1.tts_to_file(text=text, file_path=temp_path)
-            elif voice == "female_2":
-                self.female_2.tts_to_file(text=text, file_path=temp_path)
-            else:
-                inputs = self.tokenizer(text, return_tensors="pt")
-                with torch.no_grad():
-                    output = self.male_model(**inputs).waveform
-                    if voice == "male_2":
-                        output = output * 0.8
-                sf.write(temp_path, output.numpy().T, 16000)
-            
-            # Read and stream
-            audio_data, _ = sf.read(temp_path)
-            chunk_size = 16000  # 1 second chunks
-            for i in range(0, len(audio_data), chunk_size):
-                yield audio_data[i:i + chunk_size]
-            
-            # Clean up
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-                
-        except Exception as e:
-            print(f"Streaming error: {str(e)}")
-            yield None
-
-    def start_task_processor(self):
-        """Simple task status monitoring"""
-        def process_tasks():
-            while True:
-                try:
-                    time.sleep(1)  # Check every second
-                except Exception as e:
-                    print(f"Task processing error: {str(e)}")
-
-        threading.Thread(target=process_tasks, daemon=True).start()
-
-    def check_status(self, task_id):
-        """Check task status"""
-        return {
-            "status": self.task_statuses.get(task_id, "not_found"),
-            "audio_path": os.path.join(self.output_dir, f"{task_id}.wav") 
-            if self.task_statuses.get(task_id) == "completed" 
-            else None
+        self.voice_info = {
+            "id": "female_tacotron2",
+            "language": "en-US",
+            "gender": "female",
+            "description": "Standard Female Voice (Tacotron2)"
         }
+        print("LQ TTS model loaded.")
 
     def get_available_voices(self):
-        """List available voices"""
-        return {
-            "voices": [
-                {
-                    "id": "female_1",
-                    "language": "en-US",
-                    "gender": "female",
-                    "description": "LJSpeech Tacotron2-DDC voice"
-                },
-                {
-                    "id": "female_2",
-                    "language": "en-US",
-                    "gender": "female",
-                    "description": "LJSpeech FastPitch voice"
-                },
-                {
-                    "id": "male_1",
-                    "language": "en-US",
-                    "gender": "male",
-                    "description": "Default male voice"
-                },
-                {
-                    "id": "male_2",
-                    "language": "en-US",
-                    "gender": "male",
-                    "description": "Lower pitched male voice"
-                }
-            ]
-        }
+        return {"voices": [self.voice_info]}
 
-# Initialize TTS service
-tts_service = PublicDynamicTTS()
+    def save_speech_file(self, text, format="mp3"):
+        format = format.lower()
+        if format not in self.supported_formats:
+            raise ValueError(f"Unsupported format: {format}")
+
+        temp_wav_path = os.path.join(self.output_dir, f"temp_{time.time_ns()}.wav")
+        final_path = temp_wav_path.replace(".wav", f".{format}")
+
+        self.model.tts_to_file(text=text, file_path=temp_wav_path)
+
+        if format != 'wav':
+            audio = AudioSegment.from_wav(temp_wav_path)
+            audio.export(final_path, format=format)
+            os.remove(temp_wav_path)  # Clean up intermediate wav
+
+        return {"status": "success", "file_path": final_path}
+
+class HQTTS:
+    """High Quality TTS using Kokoro."""
+    def __init__(self):
+        if not KOKORO_AVAILABLE:
+            raise ImportError("Kokoro library not available")
+        
+        self.kokoro_gpu = None
+        self.kokoro_cpu = None
+        self.kokoro_pipelines = {}
+        self.kokoro_voices = {
+            '🇺🇸 🚺 Heart ❤️': 'af_heart', '🇺🇸 🚺 Bella 🔥': 'af_bella', '🇺🇸 🚺 Nicole 🎧': 'af_nicole',
+            '🇺🇸 🚺 Aoede': 'af_aoede', '🇺🇸 🚺 Kore': 'af_kore', '🇺🇸 🚺 Sarah': 'af_sarah',
+            '🇺🇸 🚺 Nova': 'af_nova', '🇺🇸 🚺 Sky': 'af_sky', '🇺🇸 🚺 Alloy': 'af_alloy',
+            '🇺🇸 🚺 Jessica': 'af_jessica', '🇺🇸 🚺 River': 'af_river', '🇺🇸 🚹 Michael': 'am_michael',
+            '🇺🇸 🚹 Fenrir': 'am_fenrir', '🇺🇸 🚹 Puck': 'am_puck', '🇺🇸 🚹 Echo': 'am_echo',
+            '🇺🇸 🚹 Eric': 'am_eric', '🇺🇸 🚹 Liam': 'am_liam', '🇺🇸 🚹 Onyx': 'am_onyx',
+            '🇺🇸 🚹 Santa': 'am_santa', '🇺🇸 🚹 Adam': 'am_adam', '🇬🇧 🚺 Emma': 'bf_emma',
+            '🇬🇧 🚺 Isabella': 'bf_isabella', '🇬🇧 🚺 Alice': 'bf_alice', '🇬🇧 🚺 Lily': 'bf_lily',
+            '🇬🇧 🚹 George': 'bm_george', '🇬🇧 🚹 Fable': 'bm_fable', '🇬🇧 🚹 Lewis': 'bm_lewis',
+            '🇬🇧 🚹 Daniel': 'bm_daniel',
+        }
+        self._initialize_kokoro()
+
+    def _initialize_kokoro(self):
+        """Initialize Kokoro models and pipelines."""
+        logging.info("Initializing HQ TTS (Kokoro) model...")
+        try:
+            if CUDA_AVAILABLE:
+                logging.info("Loading Kokoro GPU model...")
+                self.kokoro_gpu = KModel().to('cuda').eval()
+            logging.info("Loading Kokoro CPU model...")
+            self.kokoro_cpu = KModel().to('cpu').eval()
+
+            logging.info("Initializing Kokoro pipelines...")
+            self.kokoro_pipelines = {
+                lang_code: KPipeline(lang_code=lang_code, model=False)
+                for lang_code in ['a', 'b']
+            }
+
+            logging.info(f"Loading {len(self.kokoro_voices)} Kokoro voice packs...")
+            for voice_id in self.kokoro_voices.values():
+                self.kokoro_pipelines[voice_id[0]].load_voice(voice_id)
+            logging.info("Kokoro initialization complete.")
+        except Exception as e:
+            logging.error(f"ERROR initializing Kokoro: {e}\n{traceback.format_exc()}")
+            raise
+
+    def get_available_voices(self):
+        """Get available HQ voices."""
+        return {"voices": self.kokoro_voices}
+
+    def synthesize(self, text, voice_id, speed=1.0, use_gpu=True):
+        """Synthesize speech using Kokoro."""
+        use_gpu = use_gpu and CUDA_AVAILABLE
+        kokoro_model = self.kokoro_gpu if use_gpu else self.kokoro_cpu
+        
+        if kokoro_model is None:
+            raise RuntimeError(f"Required Kokoro model ({'GPU' if use_gpu else 'CPU'}) not loaded")
+
+        lang_code = voice_id[0]
+        pipeline = self.kokoro_pipelines[lang_code]
+        pack = pipeline.load_voice(voice_id)
+        ps = next(pipeline(text, voice_id, speed))[1]
+        ref_s = pack[len(ps)-1].to(kokoro_model.device)
+
+        with torch.no_grad():
+            audio_tensor = kokoro_model(ps, ref_s, speed).squeeze().cpu()
+
+        output_filename = f"hq_output_{time.time_ns()}.wav"
+        output_path = os.path.join(OUTPUT_FOLDER, output_filename)
+        sf.write(output_path, audio_tensor, 24000)
+
+        return {"status": "success", "file_path": output_path}
+
+# Global TTS instances
+lq_tts_model = None
+hq_tts_model = None
+
+def initialize_lq_tts():
+    """Initialize the LQ TTS model."""
+    global lq_tts_model
+    if lq_tts_model is None:
+        lq_tts_model = LQTTS()
+    return lq_tts_model
+
+def initialize_hq_tts():
+    """Initialize the HQ TTS model."""
+    global hq_tts_model
+    if hq_tts_model is None and KOKORO_AVAILABLE:
+        hq_tts_model = HQTTS()
+    return hq_tts_model
+
+def get_lq_tts_model():
+    """Get the initialized LQ TTS model."""
+    return lq_tts_model
+
+def get_hq_tts_model():
+    """Get the initialized HQ TTS model."""
+    return hq_tts_model
+
+def is_kokoro_available():
+    """Check if Kokoro is available."""
+    return KOKORO_AVAILABLE
+
+def cleanup_gpu():
+    """Clean up GPU memory."""
+    gc.collect()
+    if CUDA_AVAILABLE:
+        torch.cuda.empty_cache()
